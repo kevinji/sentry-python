@@ -126,8 +126,8 @@ class PotelScope(Scope):
             trace_state = trace_state.add(TRACESTATE_SAMPLED_KEY, "deferred")
 
         span_context = SpanContext(
-            trace_id=int(self._propagation_context.trace_id, 16),  # type: ignore
-            span_id=int(self._propagation_context.parent_span_id, 16),  # type: ignore
+            trace_id=int(self._propagation_context.trace_id, 16),
+            span_id=int(self._propagation_context.parent_span_id, 16),
             is_remote=True,
             trace_flags=trace_flags,
             trace_state=trace_state,
@@ -157,6 +157,7 @@ _INITIAL_ISOLATION_SCOPE = PotelScope(ty=ScopeType.ISOLATION)
 
 
 def setup_initial_scopes():
+    # type: () -> None
     global _INITIAL_CURRENT_SCOPE, _INITIAL_ISOLATION_SCOPE
     _INITIAL_CURRENT_SCOPE = PotelScope(ty=ScopeType.CURRENT)
     _INITIAL_ISOLATION_SCOPE = PotelScope(ty=ScopeType.ISOLATION)
