@@ -1,4 +1,14 @@
+import pytest
+
 from sentry_sdk.tracing_utils import PropagationContext
+
+
+SAMPLED_FLAG = {
+    None: "",
+    False: "-0",
+    True: "-1",
+}
+"""Maps the `sampled` value to the flag appended to the sentry-trace header."""
 
 
 def test_empty_context():
@@ -51,6 +61,7 @@ def test_lazy_uuids():
 
 def test_property_setters():
     ctx = PropagationContext()
+
     ctx.trace_id = "X234567890abcdef1234567890abcdef"
     ctx.span_id = "X234567890abcdef"
 
@@ -58,6 +69,7 @@ def test_property_setters():
     assert ctx.trace_id == "X234567890abcdef1234567890abcdef"
     assert ctx._span_id == "X234567890abcdef"
     assert ctx.span_id == "X234567890abcdef"
+    assert ctx.dynamic_sampling_context is None
 
 
 def test_update():
@@ -81,3 +93,50 @@ def test_update():
     assert ctx.dynamic_sampling_context is None
 
     assert not hasattr(ctx, "foo")
+
+
+def test_existing_sample_rand_kept():
+    ctx = PropagationContext(
+        trace_id="00000000000000000000000000000000",
+        dynamic_sampling_context={"sample_rand": "0.5"},
+    )
+
+    # If sample_rand was regenerated, the value would be 0.8766381713144122 based on the trace_id
+    assert ctx.dynamic_sampling_context["sample_rand"] == "0.5"
+
+
+@pytest.mark.parametrize(
+    ("parent_sampled", "sample_rate", "expected_sample_rand"),
+    (
+        # Note that parent_sampled and sample_rate do not scale the
+        # sample_rand value, only determine the range of the value.
+        # Expected values are determined by parent_sampled, sample_rate,
+        # and the trace_id.
+        (None, None, "0.919221"),
+        (None, "0.5", "0.919221"),
+        (False, None, "0.919221"),
+        (True, None, "0.919221"),
+        (False, "0.0", "0.919221"),
+        (False, "0.01", "0.929221"),
+        (True, "0.01", "0.006073"),
+        (False, "0.1", "0.762590"),
+        (True, "0.1", "0.082823"),
+        (False, "0.5", "0.959610"),
+        (True, "0.5", "0.459610"),
+        (True, "1.0", "0.919221"),
+    ),
+)
+def test_sample_rand_filled(parent_sampled, sample_rate, expected_sample_rand):
+    """When continuing a trace, we want to fill in the sample_rand value if it's missing."""
+    dsc = {}
+    if sample_rate is not None:
+        dsc["sample_rate"] = sample_rate
+
+    ctx = PropagationContext().from_incoming_data(
+        {
+            "sentry-trace": f"00000000000000000000000000000000-0000000000000000{SAMPLED_FLAG[parent_sampled]}",
+            "baggage": f"sentry-sample_rate={sample_rate}",
+        }
+    )
+
+    assert ctx.dynamic_sampling_context["sample_rand"] == expected_sample_rand

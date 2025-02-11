@@ -1,4 +1,5 @@
 import contextlib
+from decimal import Decimal
 import inspect
 import os
 import re
@@ -6,6 +7,7 @@ import sys
 from collections.abc import Mapping
 from datetime import timedelta
 from functools import wraps
+from random import Random
 from urllib.parse import quote, unquote
 import uuid
 
@@ -19,6 +21,7 @@ from sentry_sdk.utils import (
     match_regex_list,
     qualname_from_function,
     to_string,
+    try_decimal,
     is_sentry_url,
     _is_external_source,
     _is_in_project_root,
@@ -418,6 +421,9 @@ class PropagationContext:
                     propagation_context = PropagationContext()
                 propagation_context.update(sentrytrace_data)
 
+        if propagation_context is not None:
+            propagation_context._fill_sample_rand()
+
         return propagation_context
 
     @property
@@ -425,6 +431,7 @@ class PropagationContext:
         # type: () -> str
         """The trace id of the Sentry trace."""
         if not self._trace_id:
+            # New trace, don't fill in sample_rand
             self._trace_id = uuid.uuid4().hex
 
         return self._trace_id
@@ -468,6 +475,54 @@ class PropagationContext:
             self.parent_sampled,
             self.dynamic_sampling_context,
         )
+
+    def _fill_sample_rand(self):
+        # type: () -> None
+        """
+        Ensure that there is a valid sample_rand value in the dynamic_sampling_context.
+
+        If there is a valid sample_rand value in the dynamic_sampling_context, we keep it.
+        Otherwise, we generate a sample_rand value according to the following:
+
+          - If we have a parent_sampled value and a sample_rate in the DSC, we compute
+            a sample_rand value randomly in the range:
+                - [0, sample_rate) if parent_sampled is True,
+                - or, in the range [sample_rate, 1) if parent_sampled is False.
+
+          - If either parent_sampled or sample_rate is missing, we generate a random
+            value in the range [0, 1).
+
+        The sample_rand is deterministically generated from the trace_id, if present.
+
+        This function does nothing if there is no dynamic_sampling_context.
+        """
+        if self.dynamic_sampling_context is None:
+            return
+
+        sample_rand = SampleRandValue.try_from_incoming(
+            self.dynamic_sampling_context.get("sample_rand")
+        )
+        if sample_rand is not None and 0 <= sample_rand.inner() < 1:
+            # sample_rand is present and valid, so don't overwrite it
+            return
+
+        # Get the sample rate and compute the transformation that will map the random value
+        # to the desired range: [0, 1), [0, sample_rate), or [sample_rate, 1).
+        sample_rate = try_decimal(self.dynamic_sampling_context.get("sample_rate"))
+        lower, upper = _sample_rand_range(self.parent_sampled, sample_rate)
+
+        try:
+            sample_rand = SampleRandValue.generate(
+                self.trace_id, interval=(lower, upper)
+            )
+        except ValueError:
+            # ValueError is raised if the interval is invalid, i.e. lower >= upper.
+            # lower >= upper might happen if the incoming trace's sampled flag
+            # and sample_rate are inconsistent, e.g. sample_rate=0.0 but sampled=True.
+            # We cannot generate a sensible sample_rand value in this case.
+            return
+
+        self.dynamic_sampling_context["sample_rand"] = str(sample_rand)
 
 
 class Baggage:
@@ -643,9 +698,105 @@ class Baggage:
         return f'<Baggage "{self.serialize(include_third_party=True)}", mutable={self.mutable}>'
 
 
+class SampleRandValue:
+    """
+    Lightweight wrapper around a Decimal value, with utilities for
+    generating a sample rand value from a trace ID, parsing incoming
+    sample_rand values, and for consistent serialization to a string.
+
+    SampleRandValue instances are immutable.
+    """
+
+    DECIMAL_0 = Decimal(0)
+    DECIMAL_1 = Decimal(1)
+
+    PRECISION = 6
+    """We use this many decimal places for the sample_rand value.
+
+    If this value ever needs to be changed, also update the formatting
+    in the __str__ method.
+    """
+
+    def __init__(self, value):
+        # type: (Decimal) -> None
+        """
+        Initialize SampleRandValue from a Decimal value. This constructor
+        should only be called internally by the SampleRandValue class.
+        """
+        self._value = value
+
+    @classmethod
+    def try_from_incoming(cls, incoming_value):
+        # type: (Optional[str]) -> Optional[SampleRandValue]
+        """
+        Attempt to parse an incoming sample_rand value from a string.
+
+        Returns None if the incoming value is None or cannot be parsed as a Decimal.
+        """
+        value = try_decimal(incoming_value)
+        if value is not None and cls.DECIMAL_0 <= value < cls.DECIMAL_1:
+            return cls(value)
+
+        return None
+
+    @classmethod
+    def generate(
+        cls,
+        trace_id,  # type: Optional[str]
+        *,
+        interval=(DECIMAL_0, DECIMAL_1),  # type: tuple[Decimal, Decimal]
+    ):
+        # type: (...) -> SampleRandValue
+        """Generate a sample_rand value from a trace ID.
+
+        The generated value will be pseudorandomly chosen from the provided
+        interval. Specifically, given (lower, upper) = interval, the generated
+        value will be in the range [lower, upper).
+
+        The pseudorandom number generator is seeded with the trace ID.
+        """
+        lower_decimal, upper_decimal = interval
+        if not lower_decimal < upper_decimal:
+            raise ValueError("Invalid interval: lower must be less than upper")
+
+        # Since sample_rand values have 6-digit precision, we generate the
+        # value as an integer in the range [lower_decimal * 10**6, upper_decimal * 10**6),
+        # and then scale it to the desired range.
+        lower_int = int(lower_decimal.scaleb(cls.PRECISION))
+        upper_int = int(upper_decimal.scaleb(cls.PRECISION))
+
+        if lower_int == upper_int:
+            # Edge case: lower_decimal < upper_decimal, but due to rounding,
+            # lower_int == upper_int. In this case, we return
+            # lower_int.scaleb(-SCALE_EXPONENT) here, since calling randrange()
+            # with the same lower and upper bounds will raise an error.
+            return cls(Decimal(lower_int).scaleb(-cls.PRECISION))
+
+        value = Random(trace_id).randrange(lower_int, upper_int)
+        return cls(Decimal(value).scaleb(-cls.PRECISION))
+
+    def inner(self):
+        # type: () -> Decimal
+        """
+        Return the inner Decimal value.
+        """
+        return self._value
+
+    def __str__(self):
+        # type: () -> str
+        """
+        Return a string representation of the SampleRandValue.
+
+        The string representation has 6 decimal places.
+        """
+        # Lint E231 is a false-positive here. If we add a space after the :,
+        # then the formatter puts an extra space before the decimal numbers.
+        return f"{self._value:.6f}"  # noqa: E231
+
+
 def should_propagate_trace(client, url):
     # type: (sentry_sdk.client.BaseClient, str) -> bool
-    """
+    """u
     Returns True if url matches trace_propagation_targets configured in the given client. Otherwise, returns False.
     """
     trace_propagation_targets = client.options["trace_propagation_targets"]
@@ -746,6 +897,21 @@ def get_current_span(scope=None):
     scope = scope or sentry_sdk.get_current_scope()
     current_span = scope.span
     return current_span
+
+
+def _sample_rand_range(parent_sampled, sample_rate):
+    # type: (Optional[bool], Optional[Decimal]) -> tuple[Decimal, Decimal]
+    """
+    Compute the lower (inclusive) and upper (exclusive) bounds of the range of values
+    that a generated sample_rand value must fall into, given the parent_sampled and
+    sample_rate values.
+    """
+    if parent_sampled is None or sample_rate is None:
+        return Decimal(0), Decimal(1)
+    elif parent_sampled is True:
+        return Decimal(0), sample_rate
+    else:  # parent_sampled is False
+        return sample_rate, Decimal(1)
 
 
 # Circular imports

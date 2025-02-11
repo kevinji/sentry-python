@@ -12,7 +12,7 @@ import threading
 import time
 from collections import namedtuple
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import partial, partialmethod, wraps
 from numbers import Real
 from urllib.parse import parse_qs, unquote, urlencode, urlsplit, urlunsplit
@@ -1888,3 +1888,18 @@ def should_be_treated_as_error(ty, value):
         return False
 
     return True
+
+
+def try_decimal(value):
+    # type: (Optional[str]) -> Optional[Decimal]
+    """Small utility which attempts to convert an Optional[str] to a Decimal.
+
+    Returns None if the value is None or if the value cannot be parsed as a Decimal.
+    """
+    if value is None:
+        return None
+
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        return None
