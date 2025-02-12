@@ -1,5 +1,5 @@
+from decimal import Decimal
 import uuid
-import random
 import warnings
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -785,6 +785,7 @@ class Transaction(Span):
         "_profile",
         "_continuous_profile",
         "_baggage",
+        "_sample_rand",
     )
 
     def __init__(  # type: ignore[misc]
@@ -808,6 +809,14 @@ class Transaction(Span):
         self._profile = None  # type: Optional[Profile]
         self._continuous_profile = None  # type: Optional[ContinuousProfile]
         self._baggage = baggage
+
+        baggage_sample_rand = (
+            None if self._baggage is None else self._baggage._sample_rand()
+        )
+        if baggage_sample_rand is not None:
+            self._sample_rand = SampleRandValue(baggage_sample_rand)
+        else:
+            self._sample_rand = SampleRandValue.generate(self.trace_id)
 
     def __repr__(self):
         # type: () -> str
@@ -1179,10 +1188,10 @@ class Transaction(Span):
             self.sampled = False
             return
 
-        # Now we roll the dice. random.random is inclusive of 0, but not of 1,
+        # Now we roll the dice. self._sample_rand is inclusive of 0, but not of 1,
         # so strict < is safe here. In case sample_rate is a boolean, cast it
         # to a float (True becomes 1.0 and False becomes 0.0)
-        self.sampled = random.random() < self.sample_rate
+        self.sampled = self._sample_rand.inner() < self.sample_rate
 
         if self.sampled:
             logger.debug(
@@ -1338,6 +1347,7 @@ def trace(func=None):
 from sentry_sdk.tracing_utils import (
     Baggage,
     EnvironHeaders,
+    SampleRandValue,
     extract_sentrytrace_data,
     has_tracing_enabled,
     maybe_create_breadcrumbs_from_span,
